@@ -4,11 +4,12 @@ import sklearn
 from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.compose import ColumnTransformer, make_column_selector
 from sklearn.preprocessing import OrdinalEncoder, FunctionTransformer
+from sklearn.pipeline import Pipeline
 
 
 class CustomOneHotEncoder(BaseEstimator, TransformerMixin):
     def fit(self, X, y=None):
-        self.ordinal_enc_ = OrdinalEncoder(unknown_value=np.NaN, encoded_missing_value=np.NaN,
+        self.ordinal_enc_ = OrdinalEncoder(unknown_value=np.nan, encoded_missing_value=np.nan,
                                            handle_unknown='use_encoded_value')
         self.ordinal_enc_.fit(X)
         self.cat_sizes_ = []
@@ -86,5 +87,5 @@ class RobustScaleSmoothClipTransform(sklearn.base.BaseEstimator, sklearn.base.Tr
 
 
 def get_realmlp_td_s_pipeline():
-    return sklearn.pipeline.Pipeline([('one_hot', CustomOneHotPipeline()),
-                                      ('rssc', RobustScaleSmoothClipTransform())])
+    return Pipeline([('one_hot', CustomOneHotPipeline()),
+                    ('rssc', RobustScaleSmoothClipTransform())])
