@@ -5,13 +5,11 @@ import sklearn
 from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.compose import ColumnTransformer, make_column_selector
 from sklearn.preprocessing import OrdinalEncoder, FunctionTransformer
-from sklearn.utils.validation import check_array
-
 
 
 class CustomOneHotEncoder(BaseEstimator, TransformerMixin):
     def fit(self, X, y=None):
-        self.ordinal_enc_ = OrdinalEncoder(unknown_value=np.nan, encoded_missing_value=np.nan,
+        self.ordinal_enc_ = OrdinalEncoder(unknown_value=np.NaN, encoded_missing_value=np.NaN,
                                            handle_unknown='use_encoded_value')
         self.ordinal_enc_.fit(X)
         self.cat_sizes_ = []
@@ -45,57 +43,47 @@ class CustomOneHotEncoder(BaseEstimator, TransformerMixin):
 
 class CustomOneHotPipeline(BaseEstimator, TransformerMixin):
     """
-    Aplica CustomOneHotEncoder apenas para features categóricas.
+    Apply CustomOneHotEncoder only to categorical features.
     """
 
     def fit(self, X, y=None):
-        # A conversão para DataFrame deve ser feita antes
-        if not isinstance(X, pd.DataFrame):
-            X = pd.DataFrame(X)
-
-        # --- CORREÇÃO: Substituir lambda por 'passthrough' ---
+        X = pd.DataFrame(X)
         self.tfm_ = ColumnTransformer(transformers=[
             ('categorical', CustomOneHotEncoder(),
              make_column_selector(dtype_include=["string", "object", "category"])),
-
-            # Usamos 'passthrough' para indicar que as colunas restantes
-            # não devem ser modificadas. Isto é "pickle-safe".
-            ('remaining', 'passthrough',
+            ('remaining', FunctionTransformer(lambda x: x),
              make_column_selector(dtype_exclude=["string", "object", "category"]))
-        ], remainder='passthrough').fit(X)  # Adicionado remainder='passthrough' para robustez
+        ]).fit(X)
         return self
 
     def transform(self, X, y=None):
-        if not isinstance(X, pd.DataFrame):
-            X = pd.DataFrame(X)
+        # print(f'{X=}')
+        X = pd.DataFrame(X)
+        # print(f'{X=}')
         return self.tfm_.transform(X)
 
 
 class RobustScaleSmoothClipTransform(sklearn.base.BaseEstimator, sklearn.base.TransformerMixin):
     def fit(self, X, y=None):
-        # --- CORREÇÃO: Validar o tipo de dado de entrada ---
-        # Esta linha garante que X seja um array numérico real.
-        # Ela vai gerar um erro claro se receber dados complexos ou outros tipos.
-        X = check_array(X, dtype="numeric")
-
-        # O restante da sua lógica original permanece igual
+        # don't deal with dataframes for simplicity
+        assert isinstance(X, np.ndarray)
         self._median = np.median(X, axis=-2)
         quant_diff = np.quantile(X, 0.75, axis=-2) - np.quantile(X, 0.25, axis=-2)
-        max_val = np.max(X, axis=-2) # renomeado de 'max'
-        min_val = np.min(X, axis=-2) # renomeado de 'min'
+        max = np.max(X, axis=-2)
+        min = np.min(X, axis=-2)
         idxs = quant_diff == 0.0
-        quant_diff[idxs] = 0.5 * (max_val[idxs] - min_val[idxs])
+        # on indexes where the quantile difference is zero, do min-max scaling instead
+        quant_diff[idxs] = 0.5 * (max[idxs] - min[idxs])
         factors = 1.0 / (quant_diff + 1e-30)
+        # if feature is constant on the training data,
+        # set factor to zero so that it is also constant at prediction time
         factors[quant_diff == 0.0] = 0.0
         self._factors = factors
         return self
 
     def transform(self, X, y=None):
-        # Também é uma boa prática validar aqui, garantindo consistência
-        X = check_array(X, dtype="numeric")
         x_scaled = self._factors[None, :] * (X - self._median[None, :])
         return x_scaled / np.sqrt(1 + (x_scaled / 3) ** 2)
-
 
 
 def get_realmlp_td_s_pipeline():

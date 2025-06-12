@@ -1,17 +1,18 @@
-# mlp_no_preproc.py
-
 import torch
 import torch.nn as nn
 import numpy as np
 from sklearn.base import BaseEstimator, ClassifierMixin, RegressorMixin
 from sklearn.preprocessing import OrdinalEncoder
+from sklearn.utils.validation import check_array, check_is_fitted, check_X_y
+from sklearn.utils.multiclass import check_classification_targets
 from torch.utils.data import TensorDataset, DataLoader
+
+from preprocessing import get_realmlp_td_s_pipeline
 
 
 class ScalingLayer(nn.Module):
     def __init__(self, n_features: int):
         super().__init__()
-        # camada de escala aprendível (inicializada com vetores de 1)
         self.scale = nn.Parameter(torch.ones(n_features))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -24,64 +25,49 @@ class NTPLinear(nn.Module):
         self.in_features = in_features
         self.out_features = out_features
         factor = 0.0 if zero_init else 1.0
-        # peso e bias inicializados normalmente ou zerados
         self.weight = nn.Parameter(factor * torch.randn(in_features, out_features))
         self.bias = nn.Parameter(factor * torch.randn(1, out_features))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # projeta e normaliza pela raiz quadrada de in_features
-        return (1.0 / np.sqrt(self.in_features)) * (x @ self.weight) + self.bias
+        return (1. / np.sqrt(self.in_features)) * (x @ self.weight) + self.bias
 
 
 class Mish(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # função de ativação Mish: x * tanh(softplus(x))
         return x.mul(torch.tanh(torch.nn.functional.softplus(x)))
 
 
 class SimpleMLP(BaseEstimator):
-    """
-    Um MLP simples para classificação/regressão.
-    - is_classification=True → usa CrossEntropyLoss + SELU.
-    - is_classification=False → usa MSELoss + Mish.
-
-    Supõe que X (numpy array) NÃO tenha features categóricas nem NaNs:
-    X já deve estar pronto para treinar (somente floats).
-    """
-
-    def __init__(self, is_classification: bool, device: str = "cpu"):
+    def __init__(self, is_classification: bool, device: str = 'cpu'):
         self.is_classification = is_classification
         self.device = device
 
-    def fit(self, X, y, X_val=None, y_val=None):
-        # X: numpy array (n_samples, n_features)
-        # y: numpy array (n_samples,) ou (n_samples, n_outputs)
-        input_dim = X.shape[1]
-        is_class = self.is_classification
+    def fit(self, X, y, X_val=None, y_val=None, random_state=None):
+        # print(f'fit {X=}')
+        if random_state is not None:
+            torch.manual_seed(random_state)
+            np.random.seed(random_state)
 
-        # define saída:
-        if is_class:
-            # Encoder ordinal para converter labels em [0,1,...,K-1]
+        y = np.asarray(y)
+        input_dim = X.shape[1]
+        is_classification = self.is_classification
+
+        output_dim = 1 if len(y.shape) == 1 else y.shape[1]
+
+        if self.is_classification:
+            check_classification_targets(y)
             self.class_enc_ = OrdinalEncoder(dtype=np.int64)
-            y_enc = self.class_enc_.fit_transform(y.reshape(-1, 1)).ravel()
+            y = self.class_enc_.fit_transform(y[:, None])[:, 0]
             self.classes_ = self.class_enc_.categories_[0]
-            output_dim = len(self.classes_)
-            y_train = y_enc
-        else:
-            # Regressão: normalizar targets
+            output_dim = len(self.class_enc_.categories_[0])
+        else:  # standardize targets
             self.y_mean_ = np.mean(y, axis=0)
             self.y_std_ = np.std(y, axis=0)
-            y_norm = (y - self.y_mean_) / (self.y_std_ + 1e-30)
-            y_train = y_norm if y_norm.ndim > 1 else y_norm.reshape(-1, 1)
-
+            y = (y - self.y_mean_) / (self.y_std_ + 1e-30)
             if y_val is not None:
-                y_val_norm = (y_val - self.y_mean_) / (self.y_std_ + 1e-30)
-                y_val = y_val_norm if y_val_norm.ndim > 1 else y_val_norm.reshape(-1, 1)
+                y_val = (y_val - self.y_mean_) / (self.y_std_ + 1e-30)
 
-            output_dim = y_train.shape[1]
-
-        # Monta a rede:
-        act = nn.SELU if is_class else Mish
+        act = nn.SELU if is_classification else Mish
         model = nn.Sequential(
             ScalingLayer(input_dim),
             NTPLinear(input_dim, 256), act(),
@@ -90,166 +76,188 @@ class SimpleMLP(BaseEstimator):
             NTPLinear(256, output_dim, zero_init=True),
         ).to(self.device)
 
-        # Critério e otimizador
-        criterion = (
-            nn.CrossEntropyLoss(label_smoothing=0.1)
-            if is_class
-            else nn.MSELoss()
-        )
+        criterion = nn.CrossEntropyLoss(label_smoothing=0.1) if is_classification else nn.MSELoss()
         params = list(model.parameters())
-        scale_p = [params[0]]
+        scale_params = [params[0]]
         weights = params[1::2]
         biases = params[2::2]
-        optimizer = torch.optim.Adam(
-            [dict(params=scale_p), dict(params=weights), dict(params=biases)],
-            betas=(0.9, 0.95),
-        )
+        opt = torch.optim.Adam([dict(params=scale_params), dict(params=weights), dict(params=biases)],
+                                betas=(0.9, 0.95))
 
-        # Converte para tensores
-        x_train = torch.as_tensor(X, dtype=torch.float32).to(self.device)
-        y_train_tensor = torch.as_tensor(
-            y_train,
-            dtype=torch.int64 if is_class else torch.float32
-        ).to(self.device)
-        if not is_class and y_train_tensor.ndim == 1:
-            y_train_tensor = y_train_tensor.unsqueeze(1)
+        x_train = torch.as_tensor(X, dtype=torch.float32)
+        y_train = torch.as_tensor(y, dtype=torch.int64 if self.is_classification else torch.float32)
+        if not is_classification and len(y_train.shape) == 1:
+            y_train = y_train[:, None]
 
         if X_val is not None and y_val is not None:
-            x_valid = torch.as_tensor(X_val, dtype=torch.float32).to(self.device)
-            y_valid_tensor = torch.as_tensor(
-                y_val,
-                dtype=torch.int64 if is_class else torch.float32
-            ).to(self.device)
-            if not is_class and y_valid_tensor.ndim == 1:
-                y_valid_tensor = y_valid_tensor.unsqueeze(1)
+            x_valid = torch.as_tensor(X_val, dtype=torch.float32)
+            y_valid = torch.as_tensor(y_val, dtype=torch.int64 if self.is_classification else torch.float32)
+            if not is_classification and len(y_valid.shape) == 1:
+                y_valid = y_valid[:, None]
         else:
             x_valid = x_train[:0]
-            y_valid_tensor = y_train_tensor[:0]
+            y_valid = y_train[:0]
 
-        # DataLoaders
-        train_ds = TensorDataset(x_train, y_train_tensor)
-        valid_ds = TensorDataset(x_valid, y_valid_tensor)
+        train_ds = TensorDataset(x_train, y_train)
+        valid_ds = TensorDataset(x_valid, y_valid)
         n_train = x_train.shape[0]
         n_valid = x_valid.shape[0]
         n_epochs = 256
-        batch_size_train = min(256, n_train)
-        batch_size_valid = max(1, min(1024, n_valid))
+        train_batch_size = min(256, n_train)
+        valid_batch_size = max(1, min(1024, n_valid))
 
-        train_loader = DataLoader(train_ds, batch_size=batch_size_train, shuffle=True, drop_last=True)
-        valid_loader = DataLoader(valid_ds, batch_size=batch_size_valid, shuffle=False)
-
-        # Scheduler interno de learning rate:
-        def validation_metric(y_pred: torch.Tensor, y_true: torch.Tensor):
-            if is_class:
-                # erro de classificação sem normalizar
-                return torch.sum(torch.argmax(y_pred, dim=-1) != y_true)
+        def valid_metric(y_pred: torch.Tensor, y: torch.Tensor):
+            if self.is_classification:
+                # unnormalized classification error, could also convert to float and then take the mean
+                return torch.sum(torch.argmax(y_pred, dim=-1) != y)
             else:
-                # MSE 
-                return (y_pred - y_true).square().mean()
+                # MSE
+                return (y_pred - y).square().mean()
 
-        n_batches = len(train_loader)
-        base_lr = 0.04 if is_class else 0.07
+        train_dl = DataLoader(train_ds, batch_size=train_batch_size, shuffle=True, drop_last=True)
+        valid_dl = DataLoader(valid_ds, batch_size=valid_batch_size, shuffle=False)
+
+        n_train_batches = len(train_dl)
+        base_lr = 0.04 if is_classification else 0.07
         best_valid_loss = np.inf
-        best_params_copy = None
+        best_valid_params = None
 
-        # Loop de treinamento
         for epoch in range(n_epochs):
-            for batch_idx, (x_b, y_b) in enumerate(train_loader):
-                t = (epoch * n_batches + batch_idx) / (n_epochs * n_batches)
-                sched = 0.5 - 0.5 * np.cos(2 * np.pi * np.log2(1 + 15 * t))
-                lr = base_lr * sched
-                optimizer.param_groups[0]['lr'] = 6 * lr   # scale layer
-                optimizer.param_groups[1]['lr'] = lr       # weights
-                optimizer.param_groups[2]['lr'] = 0.1 * lr  # biases
+            # print(f'Epoch {epoch + 1}/{n_epochs}')
+            for batch_idx, (x_batch, y_batch) in enumerate(train_dl):
+                # set learning rates according to schedule
+                t = (epoch * n_train_batches + batch_idx) / (n_epochs * n_train_batches)
+                lr_sched_value = 0.5 - 0.5 * np.cos(2 * np.pi * np.log2(1 + 15 * t))
+                lr = base_lr * lr_sched_value
+                # print(f'{lr=:g}')
+                opt.param_groups[0]['lr'] = 6 * lr  # for scale
+                opt.param_groups[1]['lr'] = lr  # for weights
+                opt.param_groups[2]['lr'] = 0.1 * lr  # for biases
 
-                y_pred = model(x_b)
-                loss = criterion(y_pred, y_b)
+                # optimization
+                y_pred = model(x_batch.to(self.device))
+                loss = criterion(y_pred, y_batch.to(self.device))
                 loss.backward()
-                optimizer.step()
-                optimizer.zero_grad()
+                opt.step()
+                opt.zero_grad()
+                # print(f'{loss.item()=:g}')
 
-            # checar validação
+            # save parameters if validation score improves
             with torch.no_grad():
-                if x_valid.shape[0] > 0:
-                    all_preds = []
-                    for xv, _ in valid_loader:
-                        all_preds.append(model(xv))
-                    y_pred_valid = torch.cat(all_preds, dim=0)
-                    valid_loss = validation_metric(y_pred_valid, y_valid_tensor).cpu().item()
+                if x_valid.shape[0] > 0.0:
+                    y_pred_valid = torch.cat([model(x_batch.to(self.device)).detach() for x_batch, _ in valid_dl], dim=0)
+                    valid_loss = valid_metric(y_pred_valid, y_valid.to(self.device)).cpu().item()
                 else:
                     valid_loss = 0.0
-
-                if valid_loss <= best_valid_loss:
+                if valid_loss <= best_valid_loss:  # use <= for last best epoch
                     best_valid_loss = valid_loss
-                    # copia parâmetros
-                    best_params_copy = [p.detach().clone() for p in model.parameters()]
+                    best_valid_params = [p.detach().clone() for p in model.parameters()]
 
-        # Recarrega os melhores parâmetros
+        # after training, revert to best epoch
         with torch.no_grad():
-            for p_mod, p_best in zip(model.parameters(), best_params_copy):
-                p_mod.set_(p_best)
+            for p_model, p_copy in zip(model.parameters(), best_valid_params):
+                p_model.set_(p_copy)
 
         self.model_ = model
+
         return self
 
     def predict(self, X):
         x = torch.as_tensor(X, dtype=torch.float32).to(self.device)
         self.model_.eval()
         with torch.no_grad():
-            out = self.model_(x).cpu().numpy()
+            y_pred = self.model_(x).cpu().numpy()
         if self.is_classification:
-            # devolve as classes originais com inverse_transform
-            idxs = np.argmax(out, axis=-1).reshape(-1, 1)
-            return self.class_enc_.inverse_transform(idxs).ravel()
+            # return classes with highest probability
+            return self.class_enc_.inverse_transform(np.argmax(y_pred, axis=-1)[:, None])[:, 0]
         else:
-            # reescala para o domínio original
-            return out[:, 0] * self.y_std_ + self.y_mean_
+            return y_pred[:, 0] * self.y_std_ + self.y_mean_
 
     def predict_proba(self, X):
-        assert self.is_classification, "predict_proba só vale para classificação"
-        x = torch.as_tensor(X, dtype=torch.float32).to(self.device)
+        assert self.is_classification
         self.model_.eval()
+        x = torch.as_tensor(X, dtype=torch.float32).to(self.device)
         with torch.no_grad():
-            logits = self.model_(x)
-            probs = torch.softmax(logits, dim=-1).cpu().numpy()
-        return probs
+            y_pred = torch.softmax(self.model_(x), dim=-1).cpu().numpy()
+        return y_pred
 
 
-class Standalone_RealMLP_TD_S_Classifier(BaseEstimator, ClassifierMixin):
-    """
-    Wrapper de conveniência que treina SimpleMLP diretamente sobre X numérico + y.
-    (Não faz nenhuma transformação adicional.)
-    """
+class Standalone_RealMLP_TD_S_Classifier(ClassifierMixin, BaseEstimator):
+    _estimator_type = "classifier"
 
-    def __init__(self, device: str = "cpu"):
+    # --- CORREÇÃO 1: Adicionar random_state ao __init__ ---
+    def __init__(self, device: str = 'cpu', random_state=None):
         self.device = device
+        self.random_state = random_state
 
     def fit(self, X, y, X_val=None, y_val=None):
-        # Aqui assumimos que X já está 100% numérico (sem NaNs, sem colunas categóricas)
+        # --- CORREÇÃO 2: Usar o random_state para fixar as seeds ---
+        # Isso garante que a inicialização de pesos e o embaralhamento dos dados sejam sempre os mesmos
+        if self.random_state is not None:
+            torch.manual_seed(self.random_state)
+            np.random.seed(self.random_state)
+
+        # Validação de X e y
+        X, y = check_X_y(X, y, accept_sparse=False)
+        self.n_features_in_ = X.shape[1]
+
+        # O resto do seu código de fit...
+        self.prep_ = get_realmlp_td_s_pipeline()
         self.model_ = SimpleMLP(is_classification=True, device=self.device)
-        self.model_.fit(X, y, X_val, y_val)
+
+        X_transformed = self.prep_.fit_transform(X)
+
+        X_val_transformed = None
+        if X_val is not None:
+            X_val, y_val = check_X_y(X_val, y_val, accept_sparse=False)
+            X_val_transformed = self.prep_.transform(X_val)
+
+        # Passa o random_state também para o SimpleMLP
+        self.model_.fit(X_transformed, y, X_val_transformed, y_val, random_state=self.random_state)
         self.classes_ = self.model_.classes_
+        self._is_fitted = True
+
         return self
 
+    # ... __sklearn_is_fitted__, predict e predict_proba ...
+    def __sklearn_is_fitted__(self):
+        return hasattr(self, "_is_fitted") and self._is_fitted
+
     def predict(self, X):
-        return self.model_.predict(X)
+        check_is_fitted(self)
+        X = check_array(X, accept_sparse=False)
+        X_transformed = self.prep_.transform(X)
+        return self.model_.predict(X_transformed)
 
     def predict_proba(self, X):
-        return self.model_.predict_proba(X)
+        check_is_fitted(self)
+        X = check_array(X, accept_sparse=False)
+        X_transformed = self.prep_.transform(X)
+        return self.model_.predict_proba(X_transformed)
 
 
 class Standalone_RealMLP_TD_S_Regressor(BaseEstimator, RegressorMixin):
-    """
-    Wrapper de conveniência para regressão com SimpleMLP (dados já numéricos).
-    """
-
-    def __init__(self, device: str = "cpu"):
+    def __init__(self, device: str = 'cpu'):
         self.device = device
 
     def fit(self, X, y, X_val=None, y_val=None):
+        self.prep_ = get_realmlp_td_s_pipeline()
         self.model_ = SimpleMLP(is_classification=False, device=self.device)
-        self.model_.fit(X, y, X_val, y_val)
+
+        X_transformed = self.prep_.fit_transform(X)
+
+        X_val_transformed = None
+        if X_val is not None:
+            X_val_transformed = self.prep_.transform(X_val)
+
+        self.model_.fit(X_transformed, y, X_val_transformed, y_val)
         return self
 
+    def __sklearn_is_fitted__(self):
+        """Verifica se o modelo foi ajustado."""
+        return hasattr(self, 'prep_') and hasattr(self, 'model_')
+
     def predict(self, X):
-        return self.model_.predict(X)
+        check_is_fitted(self)
+        X_transformed = self.prep_.transform(X)
+        return self.model_.predict(X_transformed)
