@@ -6,15 +6,19 @@ import scikit_posthocs as sp
 import matplotlib.pyplot as plt
 
 # 1) Carrega os resultados (sem AutoML)
-df = pd.read_csv(r'resultados_cc18_sem_automl_cv.csv')
+df = pd.read_csv(r'resultados_cc18_sem_automl_cv2.csv')
 
 # 2) Drop de linhas com qualquer NaN nas métricas de teste
 df = df.dropna(subset=['mean_accuracy', 'mean_cross_entropy', 'mean_auc_ovo'])
 
 # 3) Pivot tables “wide” (linhas=datasets, colunas=modelos)
-acc_wide  = df.pivot(index='openml_id', columns='modelo', values='mean_accuracy')
-ce_wide   = df.pivot(index='openml_id', columns='modelo', values='mean_cross_entropy')
-auc_wide  = df.pivot(index='openml_id', columns='modelo', values='mean_auc_ovo')
+acc_wide_raw  = df.pivot(index='openml_id', columns='modelo', values='mean_accuracy')
+ce_wide_raw   = df.pivot(index='openml_id', columns='modelo', values='mean_cross_entropy')
+auc_wide_raw  = df.pivot(index='openml_id', columns='modelo', values='mean_auc_ovo')
+
+acc_wide = acc_wide_raw.dropna()
+auc_wide = auc_wide_raw.dropna()
+ce_wide  = ce_wide_raw.dropna()
 
 # 4) Teste de Friedman
 print("=== TESTE DE FRIEDMAN ===")

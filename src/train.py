@@ -63,7 +63,6 @@ def tunar_com_cv(modelo_nome, X_train_np, y_train_enc, seed=42):
 
     elif modelo_nome == 'xgboost':
         clf = XGBClassifier(
-            use_label_encoder=False,
             eval_metric='mlogloss',
             random_state=seed
         )
@@ -123,7 +122,7 @@ def tunar_com_cv_melhorado(modelo_nome, X_train_df, y_train_enc, seed=42):
         fit_params = {'categorical_feature': categorical_cols}
 
     elif modelo_nome == 'xgboost':
-        clf = XGBClassifier(use_label_encoder=False, eval_metric='mlogloss', random_state=seed,
+        clf = XGBClassifier(force_col_wise=True, eval_metric='mlogloss', random_state=seed,
                             tree_method='hist', enable_categorical=True)
         param_dist = {
             'n_estimators': [100, 200, 500],
