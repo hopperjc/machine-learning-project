@@ -1,28 +1,26 @@
 import time
-import numpy  as np
+import numpy as np
 import pandas as pd
 
 import openml
+from joblib import Parallel, delayed
+import traceback
 
 from sklearn.model_selection import (
     train_test_split,
-    GridSearchCV,
     RandomizedSearchCV,
-    cross_val_score,
     StratifiedKFold
 )
 from sklearn.preprocessing import LabelEncoder
-from sklearn.impute        import SimpleImputer
-from sklearn.metrics       import roc_auc_score, accuracy_score, log_loss
+from sklearn.impute import SimpleImputer
+from sklearn.metrics import roc_auc_score, accuracy_score, log_loss
 from scipy.stats import loguniform
 
-from lightgbm  import LGBMClassifier
-from xgboost   import XGBClassifier
-from catboost  import CatBoostClassifier
+from lightgbm import LGBMClassifier
+from xgboost import XGBClassifier
+from catboost import CatBoostClassifier
 
-from mlp               import Standalone_RealMLP_TD_S_Classifier
-from preprocessing     import get_realmlp_td_s_pipeline
-
+from mlp import Standalone_RealMLP_TD_S_Classifier
 
 def carregar_base_openml(openml_id, test_size=0.3, seed=42):
     """
@@ -36,7 +34,7 @@ def carregar_base_openml(openml_id, test_size=0.3, seed=42):
 
     # Se y vier como Series, converte para array
     if isinstance(y, pd.Series):
-        y = y.values.reshape(-1,)
+        y = y.values.reshape(-1, )
 
     X_train_df, X_test_df, y_train, y_test = train_test_split(
         X_df, y,
@@ -47,72 +45,14 @@ def carregar_base_openml(openml_id, test_size=0.3, seed=42):
     return X_train_df, X_test_df, y_train, y_test
 
 
-def tunar_com_cv(modelo_nome, X_train_np, y_train_enc, seed=42):
-    """
-    Recebe o nome do modelo ('lightgbm', 'xgboost' ou 'catboost'), faz GridSearchCV em 3 folds
-    para encontrar os melhores hiperparâmetros e retorna o estimador ajustado + informações sobre o CV.
-    """
-    cv3 = StratifiedKFold(n_splits=3, shuffle=True, random_state=seed)
-
-    if modelo_nome == 'lightgbm':
-        clf = LGBMClassifier(random_state=seed)
-        param_grid = {
-            'n_estimators': [100, 200],
-            'learning_rate': [0.01, 0.1]
-        }
-
-    elif modelo_nome == 'xgboost':
-        clf = XGBClassifier(
-            eval_metric='mlogloss',
-            random_state=seed
-        )
-        param_grid = {
-            'n_estimators': [100, 200],
-            'learning_rate': [0.01, 0.1]
-        }
-
-    elif modelo_nome == 'catboost':
-        # Desliga a criação de catboost_info para evitar erro de permissão
-        clf = CatBoostClassifier(
-            verbose=False,
-            random_seed=seed,
-            allow_writing_files=False
-        )
-        param_grid = {
-            'iterations': [100, 200],
-            'learning_rate': [0.01, 0.1]
-        }
-
-    else:
-        return None, {}
-
-    grid = GridSearchCV(
-        estimator=clf,
-        param_grid=param_grid,
-        cv=cv3,
-        scoring='accuracy',
-        n_jobs=-1,
-        verbose=0,
-        error_score='raise'
-    )
-    grid.fit(X_train_np, y_train_enc)
-
-    info_cv = {
-        'best_params':    grid.best_params_,
-        'best_score_cv':  float(grid.best_score_)
-    }
-    return grid.best_estimator_, info_cv
-
-
 def tunar_com_cv_melhorado(modelo_nome, X_train_df, y_train_enc, seed=42):
     cv3 = StratifiedKFold(n_splits=3, shuffle=True, random_state=seed)
 
-    # OBS: Passe as colunas categóricas para o LightGBM, se necessário.
     # O CatBoost e o XGBoost com enable_categorical=True as detectam pelo dtype.
     categorical_cols = X_train_df.select_dtypes(include=['category']).columns.tolist()
 
     if modelo_nome == 'lightgbm':
-        clf = LGBMClassifier(random_state=seed)
+        clf = LGBMClassifier(random_state=seed, force_col_wise=True, verbose=-1)
         param_dist = {
             'n_estimators': [100, 200, 500],
             'learning_rate': loguniform(0.01, 0.2),
@@ -122,7 +62,7 @@ def tunar_com_cv_melhorado(modelo_nome, X_train_df, y_train_enc, seed=42):
         fit_params = {'categorical_feature': categorical_cols}
 
     elif modelo_nome == 'xgboost':
-        clf = XGBClassifier(force_col_wise=True, eval_metric='mlogloss', random_state=seed,
+        clf = XGBClassifier(eval_metric='mlogloss', random_state=seed,
                             tree_method='hist', enable_categorical=True)
         param_dist = {
             'n_estimators': [100, 200, 500],
@@ -133,8 +73,10 @@ def tunar_com_cv_melhorado(modelo_nome, X_train_df, y_train_enc, seed=42):
         fit_params = {}
 
     elif modelo_nome == 'catboost':
+        cat_features_names = X_train_df.select_dtypes(include=['object', 'category']).columns.tolist()
+
         clf = CatBoostClassifier(verbose=False, random_seed=seed, allow_writing_files=False,
-                                 cat_features=categorical_cols)
+                                 cat_features=cat_features_names, thread_count=1)
         param_dist = {
             'iterations': [100, 200, 500],
             'learning_rate': loguniform(0.01, 0.2),
@@ -147,7 +89,7 @@ def tunar_com_cv_melhorado(modelo_nome, X_train_df, y_train_enc, seed=42):
     rand_search = RandomizedSearchCV(
         estimator=clf,
         param_distributions=param_dist,
-        n_iter=15,  # Aumente se tiver mais tempo computacional
+        n_iter=15,
         cv=cv3,
         scoring='accuracy',
         n_jobs=-1,
@@ -160,114 +102,6 @@ def tunar_com_cv_melhorado(modelo_nome, X_train_df, y_train_enc, seed=42):
         'best_score_cv': float(rand_search.best_score_)
     }
     return rand_search.best_estimator_, info_cv
-
-
-def avalia_modelo_com_cv(openml_id, modelo_nome, seed=42):
-    """
-    Carrega dados, faz pré‐processamento, ajusta o modelo especificado com CV interno (se aplicável),
-    calcula métricas de teste e retorna um dict com resultados completos.
-    """
-    # 1) Carrega dados originais (y em string, ex.: “good”/“bad”)
-    X_train_df, X_test_df, y_train_orig, y_test_orig = carregar_base_openml(openml_id, 0.3, seed)
-
-    # 2) LabelEncode para 0,1,... (evita erro “Invalid classes … got ['bad' 'good']”)
-    le = LabelEncoder()
-    y_train_enc = le.fit_transform(y_train_orig)
-    y_test_enc  = le.transform(y_test_orig)
-
-    # 3) Imputação das colunas numéricas (se houver)
-    num_cols = X_train_df.select_dtypes(exclude=['object','category','string']).columns
-    if len(num_cols) > 0:
-        imp = SimpleImputer(strategy='median')
-        X_train_df[num_cols] = imp.fit_transform(X_train_df[num_cols])
-        X_test_df[num_cols]  = imp.transform(X_test_df[num_cols])
-
-    # 4) Pipeline RealMLP (CustomOneHot + RobustScale) → output numpy array
-    pipeline = get_realmlp_td_s_pipeline()
-    X_train_np = pipeline.fit_transform(X_train_df.values)
-    X_test_np  = pipeline.transform( X_test_df.values)
-
-    # 5) Define modelo e faz CV interno conforme tipo
-    best_params_info = {}
-    clf_final        = None
-
-    modelo_lower = modelo_nome.lower()
-    if modelo_lower == 'realmlp':
-        # MLP customizado (não faz busca de hiperparâmetros aqui)
-        clf_tmp = Standalone_RealMLP_TD_S_Classifier(device='cpu')
-        cv3 = StratifiedKFold(n_splits=3, shuffle=True, random_state=seed)
-
-        # Mede acurácia no CV de treino
-        scores_acc = cross_val_score(
-            clf_tmp, X_train_np, y_train_enc,
-            cv=cv3, scoring='accuracy', n_jobs=1
-        )
-        best_params_info['cv_accuracy_mean'] = float(np.mean(scores_acc))
-        best_params_info['cv_accuracy_std']  = float(np.std(scores_acc))
-
-        # Ajusta modelo no dataset de treino completo
-        clf_final = Standalone_RealMLP_TD_S_Classifier(device='cpu')
-        t0 = time.time()
-        clf_final.fit(X_train_np, y_train_enc, X_val=None, y_val=None)
-        treino_time = time.time() - t0
-
-        # Faz inferência no conjunto de teste
-        t1 = time.time()
-        y_pred_enc  = clf_final.predict(X_test_np)
-        y_proba_enc = clf_final.predict_proba(X_test_np)
-        infer_time  = time.time() - t1
-
-        y_true = y_test_enc
-
-    elif modelo_lower in ['lightgbm', 'xgboost', 'catboost']:
-        # Busca de hiperparâmetros via CV interno
-        estimator_tunado, info_cv = tunar_com_cv(modelo_lower, X_train_np, y_train_enc, seed=seed)
-        best_params_info.update(info_cv)
-
-        # Ajusta o estimador tunado no conjunto de treino
-        t0 = time.time()
-        estimator_tunado.fit(X_train_np, y_train_enc)
-        treino_time = time.time() - t0
-
-        # Faz inferência no conjunto de teste
-        t1 = time.time()
-        y_proba_enc = estimator_tunado.predict_proba(X_test_np)
-        y_pred_enc  = estimator_tunado.predict(X_test_np)
-        infer_time  = time.time() - t1
-
-        clf_final = estimator_tunado
-        y_true    = y_test_enc
-
-    else:
-        raise ValueError(
-            f"Modelo '{modelo_nome}' não suportado. "
-            "Use apenas: realmlp, lightgbm, xgboost ou catboost."
-        )
-
-    # 6) Métricas no teste final
-    n_classes = len(np.unique(y_true))
-    if n_classes == 2:
-        auc_ovo = roc_auc_score(y_true, y_proba_enc[:, 1])
-    else:
-        auc_ovo = roc_auc_score(y_true, y_proba_enc, multi_class='ovo')
-
-    acc = accuracy_score(y_true, y_pred_enc)
-    ce  = log_loss(y_true, y_proba_enc)
-
-    resultados = {
-        'openml_id':          openml_id,
-        'modelo':             modelo_lower,
-        'n_train':            len(y_train_enc),
-        'n_test':             len(y_test_enc),
-        'n_classes':          n_classes,
-        'treino_time_sec':    float(treino_time),
-        'infer_time_sec':     float(infer_time),
-        'mean_auc_ovo':       float(auc_ovo),
-        'mean_accuracy':      float(acc),
-        'mean_cross_entropy': float(ce),
-        **best_params_info
-    }
-    return resultados
 
 
 def avalia_modelo_com_cv_corrigido(openml_id, modelo_nome, seed=42):
@@ -290,6 +124,14 @@ def avalia_modelo_com_cv_corrigido(openml_id, modelo_nome, seed=42):
         if col in X_train_df.columns:
             X_train_df[col] = X_train_df[col].astype('category')
             X_test_df[col] = X_test_df[col].astype('category')
+
+    cat_cols = X_train_df.select_dtypes(include=['category', 'object']).columns
+    if len(cat_cols) > 0:
+        # Converte para 'object' (string) e preenche NaNs de uma só vez.
+        # Isso evita todos os warnings de dtype incompatível do Pandas.
+        for col in cat_cols:
+            X_train_df.loc[:, col] = X_train_df[col].astype(str).fillna("__MISSING__")
+            X_test_df.loc[:, col] = X_test_df[col].astype(str).fillna("__MISSING__")
 
     # --- Passo 2: Tratamento Comum de Dados Faltantes ---
     # Imputa valores numéricos faltantes usando a mediana dos dados de TREINO.
@@ -356,26 +198,60 @@ if __name__ == '__main__':
 
     # Lista dos 30 datasets do CC18
     cc18_ids = [
-        11, 15, 18, 23, 29, 31, 37, 50, 54, 188,
-        307, 458, 469, 1049, 1050, 1063, 1068, 1462, 1464, 1468,
-        1480, 1494, 1501, 1510, 6332, 23381, 40966, 40975, 40982, 40994
-    ]
+            11, 15, 18, 23, 29, 31, 37, 50, 54, 188,
+            307, 458, 469, 1049, 1050, 1063, 1068, 1462, 1464, 1468,
+            1480, 1494, 1501, 1510, 6332, 23381, 40966, 40975, 40982, 40994
+        ]
     modelos = ['realmlp', 'lightgbm', 'xgboost', 'catboost']
 
-    todos_resultados = []
+    # Este loop sequencial garante que todos os datasets sejam baixados antes do paralelismo.
+    print("--- Aquecendo o cache: Baixando todos os datasets necessários ---")
     for oid in cc18_ids:
-        for m in modelos:
-            print(f"--- Avaliando {m} no dataset {oid} com CV interno ---")
-            try:
-                res = avalia_modelo_com_cv_corrigido(oid, modelo_nome=m, seed=42)
-                todos_resultados.append(res)
-            except Exception as e:
-                print(f"Erro em {m} @ {oid}: {e}")
-                continue
+        try:
+            openml.datasets.get_dataset(oid, download_data=True)
+            print(f"Dataset {oid} OK.")
+        except Exception as e:
+            print(f"!!! Falha ao baixar o dataset {oid}: {e} !!!")
+    print("--- Aquecimento de cache concluído ---\n")
 
-    # Monta DataFrame final e grava CSV
-    df_all = pd.DataFrame(todos_resultados)
-    df_all.to_csv('resultados_cc18_sem_automl_cv2.csv', index=False)
+    # 1. Criar uma lista de todas as tarefas a serem executadas
+    # Cada tarefa é uma chamada à sua função de avaliação com os argumentos definidos.
+    print("Preparando tarefas para execução paralela...")
+    tasks = [
+        delayed(avalia_modelo_com_cv_corrigido)(oid, m)
+        for oid in cc18_ids
+        for m in modelos
+    ]
 
-    print("\nTabela final (sem AutoML):")
-    print(df_all.head(10))
+    # 2. Executar as tarefas em paralelo
+    print(f"Iniciando a execução paralela de {len(tasks)} tarefas...")
+
+
+    def run_safely(oid, m):
+        """Wrapper para chamar a função de avaliação e capturar exceções."""
+        print(f"--- Processando: {m} no dataset {oid} ---")
+        try:
+            return avalia_modelo_com_cv_corrigido(openml_id=oid, modelo_nome=m, seed=42)
+        except Exception as e:
+            print(f"!!! ERRO em {m} @ {oid}: {e} !!!")
+            traceback.print_exc()  # Imprime o traceback completo do erro
+            return None  # Retorna None se a tarefa falhar
+
+
+    # Recria a lista de tarefas usando o wrapper seguro
+    tasks_safe = [delayed(run_safely)(oid, m) for oid in cc18_ids for m in modelos]
+
+    # Executa a versão segura em paralelo
+    results_with_none = Parallel(n_jobs=-2, verbose=10)(tasks_safe)
+
+    # 3. Filtra os resultados de tarefas que falharam
+    todos_resultados = [res for res in results_with_none if res is not None]
+
+    # 4. Monta DataFrame final e grava CSV
+    if todos_resultados:
+        df_all = pd.DataFrame(todos_resultados)
+        df_all.to_csv('resultados_cc18_sem_automl_paralelo.csv', index=False)
+        print("\n--- Tabela final (sem AutoML) ---")
+        print(df_all.head(10))
+    else:
+        print("\nNenhuma tarefa foi concluída com sucesso.")
