@@ -1,0 +1,7 @@
+modelo,ACC_Rank_Medio,AUC_OVO_Rank_Medio,CE_Rank_Medio
+autogluon,2.4167,2.3,1.8
+autosklearn,3.1333,3.3833,3.7
+lightgbm,3.9833,3.5333,3.9667
+catboost,3.6333,3.55,3.3667
+xgboost,3.8167,3.5667,3.0667
+realmlp,4.0167,4.6667,5.1
